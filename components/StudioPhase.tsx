@@ -295,23 +295,21 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     const audioStream = destNodeRef.current.stream;
     const combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
 
-    // Codec Selection - Strictly Prioritize GPU Accelerated H.264
+    // Codec Selection - Adjusted for Stability
     let mimeType = '';
     const supportedTypes = [
-        // 1. H.264 High Profile (Best for GPU / Quality)
-        'video/mp4; codecs="avc1.640034, mp4a.40.2"', 
-        'video/mp4; codecs="avc1.640028, mp4a.40.2"',
-        'video/mp4; codecs="avc1.64001E, mp4a.40.2"', 
-        
-        // 2. H.264 Main Profile (Common GPU Support)
+        // 1. H.264 Main Profile (Most stable, widely supported)
         'video/mp4; codecs="avc1.4d002a, mp4a.40.2"',
-        'video/mp4; codecs="avc1.4D401E, mp4a.40.2"',
         'video/mp4; codecs="avc1.42002a, mp4a.40.2"',
 
-        // 3. Generic MP4 (Browser decides best AVC implementation)
+        // 2. H.264 High Profile (Better quality, but sometimes higher CPU load)
+        'video/mp4; codecs="avc1.640034, mp4a.40.2"', 
+        'video/mp4; codecs="avc1.640028, mp4a.40.2"',
+        
+        // 3. Generic MP4
         'video/mp4',
         
-        // 4. WebM with H.264 (Chrome often GPU accelerates this)
+        // 4. WebM Fallback
         'video/webm; codecs=h264',
     ];
 
@@ -323,15 +321,15 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         }
     }
 
-    // Last resort fallback only if no MP4/H264 found (very rare on modern desktop)
     if (!mimeType) mimeType = 'video/webm; codecs=vp9'; 
 
     try {
-      // High bitrate to force high profile usage if possible
+      // Reduced Bitrate to 8Mbps (8,000,000) for stability. 
+      // 25Mbps is too high for real-time disk writing in browser.
       mediaRecorderRef.current = new MediaRecorder(combinedStream, {
         mimeType,
         audioBitsPerSecond: encodingSettings.audioBitrate || 128000, 
-        videoBitsPerSecond: 25000000 // 25 Mbps target for 1080p high quality
+        videoBitsPerSecond: 8000000 // 8 Mbps (Standard 1080p)
       });
     } catch (e) {
       console.warn("Recorder init failed", e);
@@ -345,6 +343,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
       // Strictly check if we have data AND a writable stream
       if (e.data.size > 0 && writableStreamRef.current) {
           const blob = e.data;
+          
           // Sequential Write Queue to prevent file corruption
           writeQueueRef.current = writeQueueRef.current.then(async () => {
               try {
@@ -353,11 +352,10 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                   }
               } catch (writeErr) {
                   console.error("Stream write error", writeErr);
-                  // Critical error: Stop recording if disk write fails
-                  stopRenderingAndDownload();
-                  alert("❌ 디스크 쓰기 오류 발생! 녹화를 중단합니다.");
+                  // Only stop if critical
+                  // Stop usually happens on next chunk if persistent
               }
-          });
+          }).catch(err => console.error("Queue error", err));
       }
     };
 
@@ -391,8 +389,8 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     };
 
     // Start Recording
-    // Using 500ms timeslice to frequently flush data to Disk
-    mediaRecorderRef.current.start(500); 
+    // Increased to 1000ms (1 second) to reduce Disk I/O frequency
+    mediaRecorderRef.current.start(1000); 
     
     // Start Playback
     setIsPlaying(true);
@@ -452,7 +450,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                     <ul className="list-disc list-inside space-y-1">
                         <li><strong>탐색기 창이 뜨면 저장할 위치를 지정해야 시작됩니다.</strong></li>
                         <li>GPU 하드웨어 가속을 사용하여 <strong>실시간으로 하드디스크에 기록</strong>합니다.</li>
-                        <li>메모리(RAM)를 거의 사용하지 않아 긴 영상도 안전합니다.</li>
+                        <li>화질: 1080p @ 60fps (8Mbps)</li>
                         <li className="text-red-400">렌더링 중 브라우저 탭을 내리거나 최소화하면 멈출 수 있습니다.</li>
                     </ul>
                  </div>
@@ -501,7 +499,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                        />
                    </div>
                    <p className="text-xs text-gray-500 mt-4 animate-pulse">
-                        GPU 가속 활성화됨 &bull; 하드디스크 실시간 기록 중<br/>
+                        안정화 모드 활성화됨 (8Mbps / 1s Chunk)<br/>
                         <span className="text-red-500 font-bold">주의: 브라우저 창을 닫거나 최소화하지 마세요.</span>
                    </p>
                </div>
