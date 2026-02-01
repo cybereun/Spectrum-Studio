@@ -1,0 +1,5 @@
+{
+  "name": "Spectrum Studio",
+  "description": "A browser-based, client-side video creator for YouTube playlists featuring audio visualization, background effects, and local rendering without external APIs.",
+  "requestFramePermissions": []
+}
