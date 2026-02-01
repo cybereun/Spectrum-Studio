@@ -331,9 +331,8 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         const width = 1280; 
         const height = 720;
         
-        // Default try HEVC (H.265)
-        let chosenCodec = 'hvc1'; 
-        let videoConfig: VideoEncoderConfig = {
+        // Define Configs
+        const hevcConfig: VideoEncoderConfig = {
             codec: 'hvc1.1.6.L120.B0', // HEVC Main Profile, Level 4.0
             width,
             height,
@@ -341,40 +340,63 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             framerate: fps,
         };
 
-        // Check if HEVC is supported
-        try {
-            const support = await VideoEncoder.isConfigSupported(videoConfig);
-            if (!support.supported) {
-                throw new Error("HEVC unsupported");
-            }
-        } catch (e) {
-            console.warn("HEVC not supported by browser/hardware, falling back to AVC (H.264).");
-            chosenCodec = 'avc1';
-            videoConfig = {
-                codec: 'avc1.640028', // H.264 High Profile
-                width,
-                height,
-                bitrate: selectedPreset.bitrate,
-                framerate: fps,
-            };
+        const avcConfig: VideoEncoderConfig = {
+            codec: 'avc1.640028', // H.264 High Profile
+            width,
+            height,
+            bitrate: selectedPreset.bitrate,
+            framerate: fps,
+        };
 
-            // Check if H.264 High Profile is supported
-            const avcSupport = await VideoEncoder.isConfigSupported(videoConfig);
-            if (!avcSupport.supported) {
-                 // Fallback to Baseline if High profile fails
-                 console.warn("AVC High Profile not supported, falling back to Baseline.");
-                 videoConfig.codec = 'avc1.420028'; 
+        let activeConfig = avcConfig;
+        let activeCodecMuxerString = 'avc1';
+
+        // TEST HEVC Support Robustly
+        try {
+            // Static check
+            const support = await VideoEncoder.isConfigSupported(hevcConfig);
+            if (!support.supported) throw new Error("HEVC unsupported by browser");
+
+            // Runtime check (Dummy Encoder)
+            // Some browsers pass static check but fail on configure if hardware resources are missing
+            const dummyEncoder = new VideoEncoder({
+                output: () => {}, 
+                error: (e) => console.error("HEVC Dummy Error", e)
+            });
+            
+            await dummyEncoder.configure(hevcConfig);
+            if (dummyEncoder.state === "configured") {
+                 activeConfig = hevcConfig;
+                 activeCodecMuxerString = 'hvc1';
+                 dummyEncoder.close();
+            } else {
+                 throw new Error("HEVC configuration failed");
+            }
+
+        } catch (e) {
+            console.warn("HEVC check failed, falling back to AVC.", e);
+            
+            // Fallback Check for AVC High Profile
+            try {
+                const avcSupport = await VideoEncoder.isConfigSupported(avcConfig);
+                if (!avcSupport.supported) {
+                    console.warn("AVC High Profile unsupported, falling back to Baseline.");
+                    avcConfig.codec = 'avc1.42001f'; // Baseline
+                }
+                activeConfig = avcConfig;
+                activeCodecMuxerString = 'avc1';
+            } catch (e2) {
+                console.error("Critical: AVC check failed", e2);
             }
         }
         
-        setUsedCodec(chosenCodec === 'hvc1' ? 'HEVC (H.265)' : 'AVC (H.264)');
+        setUsedCodec(activeCodecMuxerString === 'hvc1' ? 'HEVC (H.265)' : 'AVC (H.264)');
 
-        // 4. Setup Muxer with determined codec
-        // mp4-muxer expects 'hvc1' or 'avc1' string for codec
+        // 4. Setup Muxer with validated codec
         const muxer = new Muxer({
             target: new FileSystemWritableFileStreamTarget(await fileHandle.createWritable()),
             video: {
-                codec: chosenCodec === 'hvc1' ? 'hvc1' : 'avc1', 
+                codec: activeCodecMuxerString === 'hvc1' ? 'hvc1' : 'avc1', 
                 width,
                 height,
                 frameRate: fps
@@ -387,15 +409,20 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             firstTimestampBehavior: 'offset', 
         });
 
+        // 5. Setup Real Video Encoder
         const videoEncoder = new VideoEncoder({
             output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-            error: (e) => { console.error("Video Encode Error", e); alert("인코딩 오류: " + e.message); }
+            error: (e) => { 
+                console.error("Video Encode Error", e); 
+                alert("인코딩 중 치명적 오류 발생: " + e.message); 
+                setIsRendering(false);
+            }
         });
 
-        // Configure Encoder with safe config
-        videoEncoder.configure(videoConfig);
+        // Configure with validated config
+        videoEncoder.configure(activeConfig);
 
-        // 5. Setup Audio Encoder (AAC)
+        // 6. Setup Audio Encoder (AAC)
         const audioEncoder = new AudioEncoder({
             output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
             error: (e) => console.error("Audio Encode Error", e)
@@ -408,7 +435,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             bitrate: encodingSettings.audioBitrate,
         });
 
-        // 6. RENDER LOOP
+        // 7. RENDER LOOP
         setRenderStatusText("고속 렌더링 진행 중...");
         
         const frameDuration = 1 / fps;
@@ -431,7 +458,10 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                     // B. Encode Video Frame
                     const bitmap = await createImageBitmap(canvas);
                     const videoFrame = new VideoFrame(bitmap, { timestamp: time * 1000000, duration: frameDuration * 1000000 });
+                    
+                    // Keyframe every 2 seconds
                     videoEncoder.encode(videoFrame, { keyFrame: i % (fps * 2) === 0 });
+                    
                     videoFrame.close();
                     bitmap.close();
                 }
@@ -483,7 +513,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         muxer.finalize();
         
         setRenderProgress(100);
-        alert(`✅ 렌더링 완료!\n[${usedCodec === '' ? chosenCodec : usedCodec}] 코덱 사용\n${renderFilename}.mp4 파일이 생성되었습니다.`);
+        alert(`✅ 렌더링 완료!\n[${usedCodec === '' ? (activeCodecMuxerString === 'hvc1' ? 'HEVC' : 'AVC') : usedCodec}] 코덱 사용\n${renderFilename}.mp4 파일이 생성되었습니다.`);
 
     } catch (e: any) {
         console.error(e);
