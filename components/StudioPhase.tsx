@@ -64,6 +64,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   
   // Render Quality State
   const [selectedPreset, setSelectedPreset] = useState<RenderConfig>(RENDER_PRESETS[1]); // Default to Balanced (30fps)
+  const [usedCodec, setUsedCodec] = useState<string>(""); // To track which codec was selected
 
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -254,7 +255,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     setShowRenderModal(false);
     setIsRendering(true);
     setRenderProgress(0);
-    setRenderStatusText("안정 모드 렌더링 중...");
+    setRenderStatusText("코덱 확인 및 초기화 중...");
     
     // Set Refs
     writableStreamRef.current = writable;
@@ -278,20 +279,37 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
 
     let mimeType = '';
     const supportedTypes = [
-        'video/mp4; codecs="avc1.4d002a, mp4a.40.2"',
+        // 1. HEVC (H.265) - High Quality & Efficiency (Prioritized)
+        'video/mp4; codecs="hvc1, mp4a.40.2"',
+        'video/mp4; codecs="hev1, mp4a.40.2"',
+
+        // 2. H.264 (AVC) High Profile - Better Quality than Main/Baseline
+        'video/mp4; codecs="avc1.640034, mp4a.40.2"', 
+        'video/mp4; codecs="avc1.640028, mp4a.40.2"',
+
+        // 3. H.264 (AVC) Main/Baseline - Standard Compatibility
+        'video/mp4; codecs="avc1.4d002a, mp4a.40.2"', 
         'video/mp4; codecs="avc1.42002a, mp4a.40.2"',
+        
+        // 4. Generic MP4
         'video/mp4',
+        
+        // 5. WebM Fallback
         'video/webm; codecs=h264',
+        'video/webm; codecs=vp9'
     ];
 
     for (const type of supportedTypes) {
         if (MediaRecorder.isTypeSupported(type)) {
             mimeType = type;
+            console.log(`✅ Selected Codec: ${mimeType}`);
             break;
         }
     }
 
-    if (!mimeType) mimeType = 'video/webm; codecs=vp9'; 
+    if (!mimeType) mimeType = 'video/webm; codecs=vp9';
+    setUsedCodec(mimeType);
+    setRenderStatusText("영상 제작 중...");
 
     try {
       mediaRecorderRef.current = new MediaRecorder(combinedStream, {
@@ -301,7 +319,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
       });
     } catch (e) {
       console.warn("Recorder init failed", e);
-      alert("녹화 초기화 실패.");
+      alert("녹화 초기화 실패. 브라우저가 선택된 코덱을 지원하지 않을 수 있습니다.");
       setIsRendering(false);
       return;
     }
@@ -428,11 +446,12 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                  </div>
 
                  <div className="p-4 bg-gray-900/50 rounded-lg text-xs text-gray-400 border border-gray-700">
-                    <p className="mb-2 text-cyan-400 font-bold">📢 렌더링 팁</p>
+                    <p className="mb-2 text-cyan-400 font-bold">📢 코덱 안내</p>
                     <ul className="list-disc list-inside space-y-1">
-                        <li><strong>'일반 (30fps)'</strong> 설정을 권장합니다. 60fps는 부하가 큽니다.</li>
-                        <li>탐색기 창이 뜨면 저장할 위치를 지정해야 시작됩니다.</li>
-                        <li className="text-red-400">렌더링 중 브라우저 탭을 닫거나 최소화하지 마세요.</li>
+                        <li><strong>HEVC (H.265)</strong> 코덱을 우선적으로 시도합니다.</li>
+                        <li>지원되지 않을 경우, 고화질 <strong>H.264 High Profile</strong>을 사용합니다.</li>
+                        <li>오디오는 표준 <strong>AAC (mp4a.40.2)</strong>로 인코딩됩니다.</li>
+                        <li className="text-red-400">주의: 렌더링 중 창을 내리거나 닫지 마세요.</li>
                     </ul>
                  </div>
 
@@ -482,6 +501,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                    </div>
                    <p className="text-xs text-gray-500 mt-4 animate-pulse">
                         {selectedPreset.label} 모드 동작 중<br/>
+                        <span className="font-mono text-cyan-500">Codec: {usedCodec}</span><br/>
                         <span className="text-red-500 font-bold">주의: 브라우저 창을 닫거나 최소화하지 마세요.</span>
                    </p>
                </div>
