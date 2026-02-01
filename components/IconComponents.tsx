@@ -34,7 +34,9 @@ import {
   Camera,
   ScanLine,
   Monitor,
-  Gauge
+  Gauge,
+  ArrowUp,
+  ArrowDown
 } from 'lucide-react';
 
 export {
@@ -73,5 +75,7 @@ export {
   Camera,
   ScanLine,
   Monitor,
-  Gauge
+  Gauge,
+  ArrowUp,
+  ArrowDown
 };

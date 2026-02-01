@@ -301,6 +301,22 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              ctx.beginPath();
              ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
              ctx.fill();
+          } else if (settings.particleEffect === 'heart') {
+             if (settings.particleColorMode === 'fixed' && settings.particleColor === '#ffffff') ctx.fillStyle = '#ff69b4';
+             else ctx.fillStyle = defaultColor;
+             
+             ctx.translate(p.x, p.y);
+             ctx.rotate(Math.sin(p.wobble || 0) * 0.2); 
+             p.wobble = (p.wobble || 0) + 0.05;
+
+             const s = p.size;
+             ctx.beginPath();
+             ctx.moveTo(0, -s * 0.2);
+             ctx.bezierCurveTo(-s * 0.5, -s * 0.6, -s, -s * 0.2, -s, s * 0.2);
+             ctx.bezierCurveTo(-s, s * 0.6, -s * 0.5, s * 0.8, 0, s * 1.2);
+             ctx.bezierCurveTo(s * 0.5, s * 0.8, s, s * 0.6, s, s * 0.2);
+             ctx.bezierCurveTo(s, -s * 0.2, s * 0.5, -s * 0.6, 0, -s * 0.2);
+             ctx.fill();
           } else {
              ctx.fillStyle = defaultColor;
              ctx.beginPath();
@@ -492,7 +508,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
                  const speed = 0.5;
                  const x = (Math.sin(t * speed + i * 2) * 0.5 + 0.5) * width;
                  const y = (Math.cos(t * speed * 0.7 + i) * 0.5 + 0.5) * height;
-                 const size = Math.max(width, height) * (0.5 + Math.sin(t + i) * 0.2);
+                 const size = Math.max(width, height) * (0.25 + Math.sin(t + i) * 0.1);
                  const grad = ctx.createRadialGradient(x, y, 0, x, y, size);
                  const alpha = intensity * (0.3 + Math.sin(t * 2 + i) * 0.1);
                  if (i===0) {

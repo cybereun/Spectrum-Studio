@@ -8,7 +8,8 @@ import {
   Move, Trash2, Heart, Flame, Layout, Sliders,
   X, CloudSnow, CloudFog, Flower2, Sun,
   Activity, Film, Zap, PartyPopper, Check,
-  Sunrise, Camera, ScanLine, Monitor, Gauge
+  Sunrise, Camera, ScanLine, Monitor, Gauge,
+  ArrowUp, ArrowDown
 } from './IconComponents';
 
 interface StudioPhaseProps {
@@ -798,8 +799,8 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                                  <span className={idx === currentTrackIndex ? 'text-white' : 'text-gray-300'}>{track.name}</span>
                              </div>
                              <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                                <button onClick={() => moveTrack(idx, 'up')} className="p-1 hover:text-cyan-400 text-gray-500"><Move size={12} className="rotate-180"/></button>
-                                <button onClick={() => moveTrack(idx, 'down')} className="p-1 hover:text-cyan-400 text-gray-500"><Move size={12}/></button>
+                                <button onClick={() => moveTrack(idx, 'up')} className="p-1 hover:text-cyan-400 text-gray-500"><ArrowUp size={14}/></button>
+                                <button onClick={() => moveTrack(idx, 'down')} className="p-1 hover:text-cyan-400 text-gray-500"><ArrowDown size={14}/></button>
                                 <button onClick={() => removeTrack(track.id)} className="p-1 hover:text-red-400 text-gray-500"><Trash2 size={12}/></button>
                              </div>
                         </div>
