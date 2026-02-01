@@ -136,6 +136,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   
   // Render Quality State
   const [selectedPreset, setSelectedPreset] = useState<RenderConfig>(RENDER_PRESETS[1]); 
+  const [usedCodec, setUsedCodec] = useState<string>("");
 
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -277,7 +278,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     setShowRenderModal(false);
     setIsRendering(true);
     setRenderProgress(0);
-    setRenderStatusText("오디오 데이터 준비 중...");
+    setRenderStatusText("코덱 확인 및 오디오 준비 중...");
 
     try {
         // 1. Prepare Audio Buffers
@@ -291,13 +292,11 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         }
         audioContext.close();
 
-        // 2. Setup OfflineAudioContext (The High-Speed Mixer)
-        // Note: Offline context length is in sample frames
+        // 2. Setup OfflineAudioContext
         const sampleRate = 48000;
         const totalDurationSamples = Math.ceil(totalDuration * sampleRate);
         const offlineCtx = new OfflineAudioContext(2, totalDurationSamples, sampleRate);
         
-        // Schedule Tracks
         let startTime = 0;
         for (let loop = 0; loop < encodingSettings.loopCount; loop++) {
             for (const buffer of trackBuffers) {
@@ -309,16 +308,9 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             }
         }
 
-        // Setup Analyser for Visualizer (attached to offline context!)
-        // To get spectrum data during offline render, we connect a source tap to an analyser
-        // However, standard OfflineContext renders all at once.
-        // We need to use `suspend` loop to grab frames.
         const analyserNode = offlineCtx.createAnalyser();
         analyserNode.fftSize = 2048;
         
-        // Re-connect graph through analyser for visualization data
-        // We have to re-schedule strictly for the analyser tap if we want global output visualization
-        // Simpler approach: Create a master gain, connect all sources to master, master to Dest AND Analyser
         const masterGain = offlineCtx.createGain();
         masterGain.connect(offlineCtx.destination);
         masterGain.connect(analyserNode);
@@ -334,15 +326,55 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             }
         }
 
-        // 3. Setup Video Encoder (HEVC)
+        // 3. Determine Supported Video Codec (HEVC vs AVC)
         const fps = selectedPreset.fps;
-        const width = 1280; // or 1920 based on quality settings, keeping simple for now
+        const width = 1280; 
         const height = 720;
         
+        // Default try HEVC (H.265)
+        let chosenCodec = 'hvc1'; 
+        let videoConfig: VideoEncoderConfig = {
+            codec: 'hvc1.1.6.L120.B0', // HEVC Main Profile, Level 4.0
+            width,
+            height,
+            bitrate: selectedPreset.bitrate,
+            framerate: fps,
+        };
+
+        // Check if HEVC is supported
+        try {
+            const support = await VideoEncoder.isConfigSupported(videoConfig);
+            if (!support.supported) {
+                throw new Error("HEVC unsupported");
+            }
+        } catch (e) {
+            console.warn("HEVC not supported by browser/hardware, falling back to AVC (H.264).");
+            chosenCodec = 'avc1';
+            videoConfig = {
+                codec: 'avc1.640028', // H.264 High Profile
+                width,
+                height,
+                bitrate: selectedPreset.bitrate,
+                framerate: fps,
+            };
+
+            // Check if H.264 High Profile is supported
+            const avcSupport = await VideoEncoder.isConfigSupported(videoConfig);
+            if (!avcSupport.supported) {
+                 // Fallback to Baseline if High profile fails
+                 console.warn("AVC High Profile not supported, falling back to Baseline.");
+                 videoConfig.codec = 'avc1.420028'; 
+            }
+        }
+        
+        setUsedCodec(chosenCodec === 'hvc1' ? 'HEVC (H.265)' : 'AVC (H.264)');
+
+        // 4. Setup Muxer with determined codec
+        // mp4-muxer expects 'hvc1' or 'avc1' string for codec
         const muxer = new Muxer({
             target: new FileSystemWritableFileStreamTarget(await fileHandle.createWritable()),
             video: {
-                codec: 'hvc1', // HEVC
+                codec: chosenCodec === 'hvc1' ? 'hvc1' : 'avc1', 
                 width,
                 height,
                 frameRate: fps
@@ -360,25 +392,10 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             error: (e) => { console.error("Video Encode Error", e); alert("인코딩 오류: " + e.message); }
         });
 
-        // HEVC Main Profile, Level 4.0 (for up to 1080p)
-        const videoConfig: VideoEncoderConfig = {
-            codec: 'hvc1.1.6.L120.B0', 
-            width,
-            height,
-            bitrate: selectedPreset.bitrate,
-            framerate: fps,
-        };
-
-        // Fallback to AVC if HEVC not supported
-        const support = await VideoEncoder.isConfigSupported(videoConfig);
-        if (!support.supported) {
-            console.warn("HEVC not supported, falling back to AVC (H.264)");
-            videoConfig.codec = 'avc1.640028'; // H.264 High Profile
-        }
-
+        // Configure Encoder with safe config
         videoEncoder.configure(videoConfig);
 
-        // 4. Setup Audio Encoder (AAC)
+        // 5. Setup Audio Encoder (AAC)
         const audioEncoder = new AudioEncoder({
             output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
             error: (e) => console.error("Audio Encode Error", e)
@@ -391,24 +408,22 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
             bitrate: encodingSettings.audioBitrate,
         });
 
-        // 5. RENDER LOOP (The Magic)
+        // 6. RENDER LOOP
         setRenderStatusText("고속 렌더링 진행 중...");
         
         const frameDuration = 1 / fps;
         const totalFrames = Math.ceil(totalDuration * fps);
         const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
 
-        // Schedule suspensions for every frame
-        // Note: loop starts from 0.0 (first frame)
         for (let i = 0; i < totalFrames; i++) {
             const time = i * frameDuration;
             
-            // Suspend context at specific time to capture frame
+            // Suspend context to capture frame
             offlineCtx.suspend(time).then(async () => {
                 // A. Update Visuals
                 analyserNode.getByteFrequencyData(dataArray);
                 
-                // Draw to hidden canvas via ref
+                // Draw
                 const canvas = canvasRef.current?.getCanvas();
                 if (canvasRef.current && canvas) {
                     canvasRef.current.drawOfflineFrame(time * 1000, dataArray);
@@ -423,38 +438,28 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
 
                 // Update Progress
                 setRenderProgress((i / totalFrames) * 90); 
-                
-                // Continue
                 offlineCtx.resume();
             });
         }
 
-        // Start the offline rendering process
-        // This promise resolves when the ENTIRE audio buffer is rendered.
-        // During this process, the `suspend` callbacks will fire, encoding video.
         const renderedBuffer = await offlineCtx.startRendering();
 
         setRenderStatusText("오디오 인코딩 중...");
 
-        // 6. Encode Audio
-        // We need to chunk the AudioBuffer into AudioData objects
         const numberOfChannels = renderedBuffer.numberOfChannels;
         const totalSamples = renderedBuffer.length;
-        const chunkDuration = 1; // 1 second chunks for encoding
+        const chunkDuration = 1; 
         const chunkSamples = sampleRate * chunkDuration;
         
         for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
             const size = Math.min(chunkSamples, totalSamples - offset);
             
-            // Interleave logic for AudioData (Format: f32-planar is preferred for AudioData but let's check input)
-            // AudioData constructor takes planar data directly!
+            // Planar format
             const planarData = new Float32Array(size * numberOfChannels);
             
             for (let ch = 0; ch < numberOfChannels; ch++) {
                 const channelData = renderedBuffer.getChannelData(ch);
-                // Copy segment
                 const segment = channelData.subarray(offset, offset + size);
-                // Planar format: Channel 0 followed by Channel 1...
                 planarData.set(segment, ch * size);
             }
 
@@ -473,13 +478,12 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
 
         setRenderStatusText("파일 패키징 중...");
 
-        // 7. Finalize
         await videoEncoder.flush();
         await audioEncoder.flush();
         muxer.finalize();
         
         setRenderProgress(100);
-        alert(`✅ 렌더링 완료!\n${renderFilename}.mp4 파일이 생성되었습니다.`);
+        alert(`✅ 렌더링 완료!\n[${usedCodec === '' ? chosenCodec : usedCodec}] 코덱 사용\n${renderFilename}.mp4 파일이 생성되었습니다.`);
 
     } catch (e: any) {
         console.error(e);
@@ -490,8 +494,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   };
 
   const cancelRendering = () => {
-    // With offline rendering, cancellation is tricky as it's a tight loop.
-    // For now, we just reload or expect the user to close.
     if(confirm("렌더링을 중단하시겠습니까? (페이지가 새로고침됩니다)")) {
         window.location.reload();
     }
@@ -554,7 +556,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                  <div className="p-4 bg-gray-900/50 rounded-lg text-xs text-gray-400 border border-gray-700">
                     <p className="mb-2 text-cyan-400 font-bold">📢 고속 렌더링 모드</p>
                     <ul className="list-disc list-inside space-y-1">
-                        <li><strong>HEVC(H.265)</strong> + <strong>AAC</strong> 코덱을 사용하여 MP4를 생성합니다.</li>
+                        <li><strong>HEVC(H.265)</strong> 코덱을 우선 시도하며, 미지원 시 <strong>H.264</strong>로 자동 전환됩니다.</li>
                         <li>재생 속도보다 훨씬 빠르게 영상을 제작합니다.</li>
                         <li className="text-red-400">주의: 하드웨어 성능에 따라 브라우저가 일시적으로 느려질 수 있습니다.</li>
                     </ul>
@@ -604,6 +606,10 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                           style={{ width: `${renderProgress}%` }}
                        />
                    </div>
+                   <p className="text-xs text-gray-500 mt-4 animate-pulse">
+                        {selectedPreset.label} 모드 동작 중<br/>
+                        <span className="font-mono text-cyan-500">Codec: {usedCodec}</span><br/>
+                   </p>
                </div>
 
                <button 
