@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, forwardRef } from 'react';
+import React, { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
 import { VisualSettings } from '../types';
 
 interface VisualizerCanvasProps {
@@ -8,23 +8,26 @@ interface VisualizerCanvasProps {
   height: number;
   isPlaying: boolean;
   isRendering?: boolean;
-  fps?: number; // New prop for Target FPS
+  fps?: number; // Target FPS
 }
 
-export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasProps>(({
+export interface VisualizerCanvasRef {
+  drawOfflineFrame: (time: number, frequencyData: Uint8Array) => void;
+  getCanvas: () => HTMLCanvasElement | null;
+}
+
+export const VisualizerCanvas = forwardRef<VisualizerCanvasRef, VisualizerCanvasProps>(({
   analyser,
   settings,
   width,
   height,
   isPlaying,
   isRendering = false,
-  fps = 30 // Default to 30 if not provided
+  fps = 30
 }, ref) => {
-  const internalRef = useRef<HTMLCanvasElement>(null);
-  const canvasRef = (ref as React.RefObject<HTMLCanvasElement>) || internalRef;
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   
   const animationRef = useRef<number>(0);
-  const workerRef = useRef<Worker | null>(null);
   const dataArrayRef = useRef<Uint8Array | null>(null);
   const colorCycleRef = useRef<number>(0);
   
@@ -47,6 +50,21 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
     rotation?: number;
     wobble?: number;
   }>>([]);
+
+  // --- External Access for Offline Rendering ---
+  useImperativeHandle(ref, () => ({
+    getCanvas: () => canvasRef.current,
+    drawOfflineFrame: (time: number, frequencyData: Uint8Array) => {
+      // 1. Manually update physics state for fixed time step
+      colorCycleRef.current += 1;
+      
+      // Update particles with a fixed delta time based on FPS
+      updateParticles(1000 / fps);
+
+      // 2. Draw
+      drawScene(canvasRef.current, frequencyData, time);
+    }
+  }));
 
   // Initialize Data Array when analyser changes
   useEffect(() => {
@@ -76,8 +94,8 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
     }
   }, [settings.logoImage]);
 
-  // Particle System Init/Reset
-  useEffect(() => {
+  // Particle System Logic
+  const initParticles = () => {
     particlesRef.current = [];
     if (settings.particleEffect !== 'none') {
       const count = Math.floor(settings.particleDensity * 2); 
@@ -89,7 +107,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
           opacity: Math.random() * settings.particleOpacity,
           angle: Math.random() * Math.PI * 2,
         };
-        // Initialize logic same as before...
+        // Init logic based on type
         if (settings.particleEffect === 'snow') {
            p.speedY = (Math.random() * 2 + 1) * settings.particleSpeed;
            p.speedX = (Math.random() - 0.5) * 0.5;
@@ -132,27 +150,60 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
         particlesRef.current.push(p);
       }
     }
+  };
+
+  useEffect(() => {
+    initParticles();
   }, [settings.particleEffect, settings.particleDensity, width, height]);
 
-  // Main Render Loop
-  useEffect(() => {
-    const canvas = canvasRef.current;
+  const updateParticles = (deltaTimeMs: number) => {
+    // Normalize speed relative to 60fps (approx 16.6ms)
+    const timeScale = deltaTimeMs / 16.66; 
+
+    particlesRef.current.forEach(p => {
+       if (settings.particleEffect === 'snow' || settings.particleEffect === 'rain' || settings.particleEffect === 'petals' || settings.particleEffect === 'confetti') {
+           p.y += p.speedY * timeScale;
+           p.x += p.speedX * timeScale;
+           if (p.y > height) { p.y = -10; p.x = Math.random() * width; }
+       } else if (settings.particleEffect === 'embers') {
+           p.y -= p.speedY * timeScale;
+           if (p.y < -10) { p.y = height + 10; p.x = Math.random() * width; }
+       } else if (settings.particleEffect === 'fog') {
+           p.x += p.speedX * timeScale;
+           if (p.x > width) { p.x = -p.size; }
+       } else {
+           p.x += p.speedX * timeScale;
+           p.y += p.speedY * timeScale;
+           if (p.x < 0 || p.x > width) p.speedX *= -1;
+           if (p.y < 0 || p.y > height) p.speedY *= -1;
+       }
+       
+       if (settings.particleEffect === 'heart') {
+          p.wobble = (p.wobble || 0) + (0.05 * timeScale);
+       }
+       
+       if (p.rotationSpeed) p.angle += p.rotationSpeed * 0.01 * timeScale;
+       if (p.pulseSpeed) {
+          p.opacity += p.pulseSpeed * timeScale;
+          if (p.opacity > 1 || p.opacity < 0.2) p.pulseSpeed *= -1;
+       }
+    });
+  };
+
+  const drawScene = (canvas: HTMLCanvasElement | null, dataArray: Uint8Array | null, time: number) => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
-    // Set canvas size
-    canvas.width = width;
-    canvas.height = height;
+    // Ensure size
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
 
-    const renderFrame = (time: number) => {
-      // 1. Clear
-      ctx.clearRect(0, 0, width, height);
-      
-      colorCycleRef.current += 1;
-      
-      // 2. Background with Filters
-      if (bgImageRef.current) {
+    // 1. Clear
+    ctx.clearRect(0, 0, width, height);
+
+    // 2. Background with Filters
+    if (bgImageRef.current) {
         ctx.save();
         const blur = `blur(${settings.bgFilterBlur}px)`;
         const brightness = `brightness(${settings.bgFilterBrightness})`;
@@ -172,23 +223,23 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
         const y = (height / 2) - (bgImageRef.current.height / 2) * scale;
         ctx.drawImage(bgImageRef.current, x, y, bgImageRef.current.width * scale, bgImageRef.current.height * scale);
         ctx.restore();
-      } else {
+    } else {
         ctx.fillStyle = '#111827';
         ctx.fillRect(0, 0, width, height);
-      }
+    }
 
-      // 3. Vignette
-      if (settings.vignette > 0) {
+    // 3. Vignette
+    if (settings.vignette > 0) {
         const gradient = ctx.createRadialGradient(width/2, height/2, height/3, width/2, height/2, height * 1.2);
         gradient.addColorStop(0, 'rgba(0,0,0,0)');
         gradient.addColorStop(1, `rgba(0,0,0,${settings.vignette})`);
         ctx.fillStyle = gradient;
         ctx.fillRect(0,0,width,height);
-      }
+    }
 
-      // 4. Logo
-      let logoRect = { x: 0, y: 0, w: 0, h: 0 };
-      if (logoImageRef.current) {
+    // 4. Logo
+    let logoRect = { x: 0, y: 0, w: 0, h: 0 };
+    if (logoImageRef.current) {
         const logoW = (logoImageRef.current.width * settings.logoSize) / 100;
         const logoH = (logoImageRef.current.height * settings.logoSize) / 100;
         const logoX = (settings.logoPosition.x / 100) * (width - logoW);
@@ -215,10 +266,10 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
         } else {
             ctx.drawImage(logoImageRef.current, logoX, logoY, logoW, logoH);
         }
-      }
+    }
 
-      // 5. Particles
-      if (settings.particleEffect !== 'none' && particlesRef.current.length > 0) {
+    // 5. Particles
+    if (settings.particleEffect !== 'none' && particlesRef.current.length > 0) {
         let baseParticleColor = settings.particleColor;
         if (settings.particleColorMode === 'rainbow') {
             const hue = (colorCycleRef.current) % 360;
@@ -228,23 +279,6 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
         const defaultColor = baseParticleColor;
 
         particlesRef.current.forEach(p => {
-          if (settings.particleEffect === 'snow' || settings.particleEffect === 'rain' || settings.particleEffect === 'petals' || settings.particleEffect === 'confetti') {
-              p.y += p.speedY;
-              p.x += p.speedX;
-              if (p.y > height) { p.y = -10; p.x = Math.random() * width; }
-          } else if (settings.particleEffect === 'embers') {
-              p.y -= p.speedY;
-              if (p.y < -10) { p.y = height + 10; p.x = Math.random() * width; }
-          } else if (settings.particleEffect === 'fog') {
-              p.x += p.speedX;
-              if (p.x > width) { p.x = -p.size; }
-          } else {
-              p.x += p.speedX;
-              p.y += p.speedY;
-              if (p.x < 0 || p.x > width) p.speedX *= -1;
-              if (p.y < 0 || p.y > height) p.speedY *= -1;
-          }
-
           ctx.save();
           ctx.globalAlpha = p.opacity * settings.particleOpacity;
           
@@ -254,14 +288,12 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
               } else {
                  ctx.fillStyle = p.color || defaultColor;
               }
-              p.angle += (p.rotationSpeed || 0) * 0.01;
               ctx.translate(p.x, p.y);
               ctx.rotate(p.angle);
               ctx.fillRect(-p.size/2, -p.size/2, p.size, p.size * 0.6);
           } else if (settings.particleEffect === 'petals') {
               if (settings.particleColorMode === 'fixed' && settings.particleColor === '#ffffff') ctx.fillStyle = '#ffb7c5';
               else ctx.fillStyle = defaultColor;
-              p.angle += (p.rotationSpeed || 0) * 0.01;
               ctx.translate(p.x, p.y);
               ctx.rotate(p.angle);
               ctx.beginPath();
@@ -276,8 +308,6 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
           } else if (settings.particleEffect === 'fireflies') {
               if (settings.particleColorMode === 'fixed' && settings.particleColor === '#ffffff') ctx.fillStyle = '#ccff00';
               else ctx.fillStyle = defaultColor;
-              p.opacity += (p.pulseSpeed || 0);
-              if (p.opacity > 1 || p.opacity < 0.2) p.pulseSpeed = (p.pulseSpeed || 0) * -1;
               ctx.globalAlpha = p.opacity * settings.particleOpacity;
               ctx.beginPath();
               ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
@@ -307,7 +337,6 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              
              ctx.translate(p.x, p.y);
              ctx.rotate(Math.sin(p.wobble || 0) * 0.2); 
-             p.wobble = (p.wobble || 0) + 0.05;
 
              const s = p.size;
              ctx.beginPath();
@@ -325,12 +354,11 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
           }
           ctx.restore();
         });
-      }
+    }
 
-      // 6. Spectrum
-      if (settings.spectrumStyle !== 'none' && analyser && dataArrayRef.current) {
-        analyser.getByteFrequencyData(dataArrayRef.current);
-        
+    // 6. Spectrum
+    if (settings.spectrumStyle !== 'none' && dataArray) {
+        // dataArray passed from outside (either real-time analyser or offline FFT)
         ctx.fillStyle = settings.spectrumColor;
         ctx.strokeStyle = settings.spectrumColor;
         ctx.lineWidth = settings.spectrumThickness;
@@ -351,7 +379,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              const totalW = barCount * spacing;
              const startX = centerX - totalW / 2;
              for(let i = 0; i < barCount; i++) {
-                const val = dataArrayRef.current[i * 2] || 0;
+                const val = dataArray[i * 2] || 0;
                 const h = val * settings.spectrumSensitivity * settings.maxHeight;
                 if (settings.spectrumColorMode === 'rainbow') ctx.fillStyle = getRainbowColor(i, barCount);
                 ctx.fillRect(startX + (i * spacing), centerY - h, settings.barWidth, h);
@@ -362,7 +390,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              const totalW = barCount * spacing;
              const startX = centerX - totalW / 2;
              for(let i = 0; i < barCount; i++) {
-                const val = dataArrayRef.current[i * 2] || 0;
+                const val = dataArray[i * 2] || 0;
                 const h = val * settings.spectrumSensitivity * settings.maxHeight * 0.7; 
                 if (settings.spectrumColorMode === 'rainbow') ctx.fillStyle = getRainbowColor(i, barCount);
                 ctx.fillRect(startX + (i * spacing), centerY - h, settings.barWidth, h);
@@ -385,7 +413,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              const bands = 6;
              const spacing = settings.barWidth + 4; 
              for(let i = 0; i < bands; i++) {
-                 const val = dataArrayRef.current[i * 10] || 0;
+                 const val = dataArray[i * 10] || 0;
                  const h = val * settings.spectrumSensitivity * 0.5 * settings.maxHeight;
                  if (settings.spectrumColorMode === 'rainbow') ctx.fillStyle = getRainbowColor(i, bands);
                  ctx.fillRect(startX + (i * spacing), startY - h/2, settings.barWidth, h);
@@ -401,7 +429,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
                  ctx.strokeStyle = grad;
              }
              for(let i = 0; i < barCount; i++) {
-                 const val = dataArrayRef.current[i] || 0;
+                 const val = dataArray[i] || 0;
                  const h = val * settings.spectrumSensitivity * settings.maxHeight;
                  const x = startX + i * sliceW;
                  const y = centerY - h; 
@@ -420,8 +448,8 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
                      ctx.globalAlpha = settings.spectrumOpacity * (1 - l * 0.2);
                  }
                  for(let i = 0; i < barCount; i++) {
-                     const val = dataArrayRef.current[i] || 0;
-                     const v = (dataArrayRef.current[i + (l * 5)] || 0) / 128.0;
+                     const val = dataArray[i] || 0;
+                     const v = (dataArray[i + (l * 5)] || 0) / 128.0;
                      const y = v * (height/4) * settings.spectrumSensitivity * settings.maxHeight;
                      const actualY = centerY + (y - (height/8)) + (l * 20);
                      const x = i * (width / barCount);
@@ -434,7 +462,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
              const radius = 100 * settings.maxHeight;
              const step = (Math.PI * 2) / barCount;
              for (let i = 0; i < barCount; i++) {
-                 const value = dataArrayRef.current[i * 2]; 
+                 const value = dataArray[i * 2]; 
                  const h = value * settings.spectrumSensitivity * 0.5 * settings.maxHeight;
                  if (settings.spectrumColorMode === 'rainbow') ctx.fillStyle = getRainbowColor(i, barCount);
                  ctx.save();
@@ -446,206 +474,177 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
         }
         
         ctx.globalAlpha = 1.0;
+    }
+
+    // 7. Screen Effects (Post-Processing)
+    if (settings.screenEffect !== 'none') {
+       const intensity = settings.screenEffectIntensity;
+       const t = time * 0.001; 
+
+       if (settings.screenEffect === 'grain') {
+           ctx.save();
+           ctx.globalCompositeOperation = 'overlay';
+           ctx.globalAlpha = intensity * 0.3;
+           for (let i = 0; i < width; i += 4) {
+               for (let j = 0; j < height; j += 4) {
+                   if (Math.random() > 0.5) {
+                       ctx.fillStyle = '#000';
+                       ctx.fillRect(i, j, 2, 2);
+                   }
+               }
+           }
+           ctx.restore();
+       } 
+       else if (settings.screenEffect === 'glitch') {
+           if (Math.random() < intensity * 0.5) {
+               const sliceH = Math.random() * 50 + 10;
+               const sliceY = Math.random() * height;
+               const offset = (Math.random() - 0.5) * 20 * intensity;
+               try {
+                   ctx.drawImage(canvas, 0, sliceY, width, sliceH, offset, sliceY, width, sliceH);
+                   ctx.save();
+                   ctx.globalCompositeOperation = 'color-dodge';
+                   ctx.globalAlpha = 0.5;
+                   ctx.fillStyle = 'rgba(255,0,0,0.5)';
+                   ctx.fillRect(0, sliceY, width, sliceH);
+                   ctx.restore();
+               } catch(e) {}
+           }
+       }
+       else if (settings.screenEffect === 'bloom') {
+           ctx.save();
+           ctx.globalCompositeOperation = 'screen';
+           ctx.filter = `blur(${20 * intensity}px)`;
+           ctx.globalAlpha = intensity * 0.5;
+           ctx.drawImage(canvas, 0, 0);
+           ctx.restore();
+       }
+       else if (settings.screenEffect === 'vhs') {
+           ctx.save();
+           ctx.globalAlpha = 0.1 * intensity;
+           ctx.fillStyle = '#000';
+           for (let y = 0; y < height; y += 4) {
+               ctx.fillRect(0, y, width, 2);
+           }
+           ctx.restore();
+       }
+       else if (settings.screenEffect === 'light-leak') {
+           ctx.save();
+           ctx.globalCompositeOperation = 'screen';
+           const leakCount = 3;
+           for(let i=0; i<leakCount; i++) {
+               const speed = 0.5;
+               const x = (Math.sin(t * speed + i * 2) * 0.5 + 0.5) * width;
+               const y = (Math.cos(t * speed * 0.7 + i) * 0.5 + 0.5) * height;
+               const size = Math.max(width, height) * (0.25 + Math.sin(t + i) * 0.1);
+               const grad = ctx.createRadialGradient(x, y, 0, x, y, size);
+               const alpha = intensity * (0.3 + Math.sin(t * 2 + i) * 0.1);
+               if (i===0) {
+                   grad.addColorStop(0, `rgba(255, 100, 50, ${alpha})`);
+                   grad.addColorStop(1, 'rgba(255, 100, 50, 0)');
+               } else if (i===1) {
+                   grad.addColorStop(0, `rgba(255, 200, 100, ${alpha})`);
+                   grad.addColorStop(1, 'rgba(255, 200, 100, 0)');
+               } else {
+                   grad.addColorStop(0, `rgba(255, 150, 150, ${alpha})`);
+                   grad.addColorStop(1, 'rgba(255, 150, 150, 0)');
+               }
+               ctx.fillStyle = grad;
+               ctx.fillRect(0,0,width,height);
+           }
+           ctx.restore();
+       }
+       else if (settings.screenEffect === 'lens-flare') {
+           ctx.save();
+           ctx.globalCompositeOperation = 'screen';
+           const sunX = (Math.sin(t * 0.3) * 0.4 + 0.5) * width;
+           const sunY = (Math.sin(t * 0.6) * 0.2 + 0.2) * height; 
+           const cx = width / 2;
+           const cy = height / 2;
+           const dx = cx - sunX;
+           const dy = cy - sunY;
+           
+           const mainGrad = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, 300 * intensity);
+           mainGrad.addColorStop(0, `rgba(255, 255, 255, ${0.8 * intensity})`);
+           mainGrad.addColorStop(0.2, `rgba(255, 255, 200, ${0.4 * intensity})`);
+           mainGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+           ctx.fillStyle = mainGrad;
+           ctx.fillRect(0,0,width,height);
+           
+           ctx.translate(sunX, sunY);
+           ctx.rotate(t * 0.1);
+           ctx.strokeStyle = `rgba(255, 255, 255, ${0.2 * intensity})`;
+           ctx.lineWidth = 2;
+           ctx.beginPath();
+           for(let i=0; i<8; i++) {
+               ctx.rotate(Math.PI / 4);
+               ctx.moveTo(0,0);
+               ctx.lineTo(100 + Math.random()*50, 0);
+           }
+           ctx.stroke();
+           ctx.setTransform(1,0,0,1,0,0);
+
+           const ghosts = [0.5, 1.2, 2.2, 3.5]; 
+           ghosts.forEach((g, i) => {
+               const gx = sunX + dx * g;
+               const gy = sunY + dy * g;
+               const size = (50 + i * 30) * intensity;
+               const alpha = (0.1 + Math.random()*0.1) * intensity;
+               ctx.beginPath();
+               ctx.arc(gx, gy, size, 0, Math.PI*2);
+               ctx.fillStyle = i%2===0 ? `rgba(200, 255, 200, ${alpha})` : `rgba(200, 200, 255, ${alpha})`;
+               ctx.fill();
+           });
+           ctx.restore();
+       }
+       else if (settings.screenEffect === 'light-sweep') {
+           ctx.save();
+           ctx.globalCompositeOperation = 'overlay'; 
+           const period = 5; 
+           const progress = (t % period) / period;
+           const startX = (progress * 2 - 0.5) * width; 
+           const sweepW = width * 0.3;
+           ctx.translate(startX, 0);
+           ctx.transform(1, 0, -0.4, 1, 0, 0); 
+           const grad = ctx.createLinearGradient(0, 0, sweepW, 0);
+           grad.addColorStop(0, 'rgba(255, 255, 255, 0)');
+           grad.addColorStop(0.5, `rgba(255, 255, 255, ${0.6 * intensity})`);
+           grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+           ctx.fillStyle = grad;
+           ctx.fillRect(0, 0, sweepW, height);
+           ctx.restore();
+       }
+    }
+  };
+
+  // Main Render Loop (Real-time Preview)
+  useEffect(() => {
+    // Only run the loop if NOT rendering.
+    // When rendering, StudioPhase drives the rendering via drawOfflineFrame.
+    if (isRendering) {
+       if (animationRef.current) cancelAnimationFrame(animationRef.current);
+       return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const render = (time: number) => {
+      if (analyser && dataArrayRef.current) {
+          analyser.getByteFrequencyData(dataArrayRef.current);
       }
-
-      // 7. Screen Effects (Post-Processing)
-      if (settings.screenEffect !== 'none') {
-         const intensity = settings.screenEffectIntensity;
-         const t = time * 0.001; 
-
-         if (settings.screenEffect === 'grain') {
-             ctx.save();
-             ctx.globalCompositeOperation = 'overlay';
-             ctx.globalAlpha = intensity * 0.3;
-             for (let i = 0; i < width; i += 4) {
-                 for (let j = 0; j < height; j += 4) {
-                     if (Math.random() > 0.5) {
-                         ctx.fillStyle = '#000';
-                         ctx.fillRect(i, j, 2, 2);
-                     }
-                 }
-             }
-             ctx.restore();
-         } 
-         else if (settings.screenEffect === 'glitch') {
-             if (Math.random() < intensity * 0.5) {
-                 const sliceH = Math.random() * 50 + 10;
-                 const sliceY = Math.random() * height;
-                 const offset = (Math.random() - 0.5) * 20 * intensity;
-                 try {
-                     ctx.drawImage(canvas, 0, sliceY, width, sliceH, offset, sliceY, width, sliceH);
-                     ctx.save();
-                     ctx.globalCompositeOperation = 'color-dodge';
-                     ctx.globalAlpha = 0.5;
-                     ctx.fillStyle = 'rgba(255,0,0,0.5)';
-                     ctx.fillRect(0, sliceY, width, sliceH);
-                     ctx.restore();
-                 } catch(e) {}
-             }
-         }
-         else if (settings.screenEffect === 'bloom') {
-             ctx.save();
-             ctx.globalCompositeOperation = 'screen';
-             ctx.filter = `blur(${20 * intensity}px)`;
-             ctx.globalAlpha = intensity * 0.5;
-             ctx.drawImage(canvas, 0, 0);
-             ctx.restore();
-         }
-         else if (settings.screenEffect === 'vhs') {
-             ctx.save();
-             ctx.globalAlpha = 0.1 * intensity;
-             ctx.fillStyle = '#000';
-             for (let y = 0; y < height; y += 4) {
-                 ctx.fillRect(0, y, width, 2);
-             }
-             ctx.restore();
-         }
-         else if (settings.screenEffect === 'light-leak') {
-             ctx.save();
-             ctx.globalCompositeOperation = 'screen';
-             const leakCount = 3;
-             for(let i=0; i<leakCount; i++) {
-                 const speed = 0.5;
-                 const x = (Math.sin(t * speed + i * 2) * 0.5 + 0.5) * width;
-                 const y = (Math.cos(t * speed * 0.7 + i) * 0.5 + 0.5) * height;
-                 const size = Math.max(width, height) * (0.25 + Math.sin(t + i) * 0.1);
-                 const grad = ctx.createRadialGradient(x, y, 0, x, y, size);
-                 const alpha = intensity * (0.3 + Math.sin(t * 2 + i) * 0.1);
-                 if (i===0) {
-                     grad.addColorStop(0, `rgba(255, 100, 50, ${alpha})`);
-                     grad.addColorStop(1, 'rgba(255, 100, 50, 0)');
-                 } else if (i===1) {
-                     grad.addColorStop(0, `rgba(255, 200, 100, ${alpha})`);
-                     grad.addColorStop(1, 'rgba(255, 200, 100, 0)');
-                 } else {
-                     grad.addColorStop(0, `rgba(255, 150, 150, ${alpha})`);
-                     grad.addColorStop(1, 'rgba(255, 150, 150, 0)');
-                 }
-                 ctx.fillStyle = grad;
-                 ctx.fillRect(0,0,width,height);
-             }
-             ctx.restore();
-         }
-         else if (settings.screenEffect === 'lens-flare') {
-             ctx.save();
-             ctx.globalCompositeOperation = 'screen';
-             const sunX = (Math.sin(t * 0.3) * 0.4 + 0.5) * width;
-             const sunY = (Math.sin(t * 0.6) * 0.2 + 0.2) * height; 
-             const cx = width / 2;
-             const cy = height / 2;
-             const dx = cx - sunX;
-             const dy = cy - sunY;
-             
-             const mainGrad = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, 300 * intensity);
-             mainGrad.addColorStop(0, `rgba(255, 255, 255, ${0.8 * intensity})`);
-             mainGrad.addColorStop(0.2, `rgba(255, 255, 200, ${0.4 * intensity})`);
-             mainGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
-             ctx.fillStyle = mainGrad;
-             ctx.fillRect(0,0,width,height);
-             
-             ctx.translate(sunX, sunY);
-             ctx.rotate(t * 0.1);
-             ctx.strokeStyle = `rgba(255, 255, 255, ${0.2 * intensity})`;
-             ctx.lineWidth = 2;
-             ctx.beginPath();
-             for(let i=0; i<8; i++) {
-                 ctx.rotate(Math.PI / 4);
-                 ctx.moveTo(0,0);
-                 ctx.lineTo(100 + Math.random()*50, 0);
-             }
-             ctx.stroke();
-             ctx.setTransform(1,0,0,1,0,0);
-
-             const ghosts = [0.5, 1.2, 2.2, 3.5]; 
-             ghosts.forEach((g, i) => {
-                 const gx = sunX + dx * g;
-                 const gy = sunY + dy * g;
-                 const size = (50 + i * 30) * intensity;
-                 const alpha = (0.1 + Math.random()*0.1) * intensity;
-                 ctx.beginPath();
-                 ctx.arc(gx, gy, size, 0, Math.PI*2);
-                 ctx.fillStyle = i%2===0 ? `rgba(200, 255, 200, ${alpha})` : `rgba(200, 200, 255, ${alpha})`;
-                 ctx.fill();
-             });
-             ctx.restore();
-         }
-         else if (settings.screenEffect === 'light-sweep') {
-             ctx.save();
-             ctx.globalCompositeOperation = 'overlay'; 
-             const period = 5; 
-             const progress = (t % period) / period;
-             const startX = (progress * 2 - 0.5) * width; 
-             const sweepW = width * 0.3;
-             ctx.translate(startX, 0);
-             ctx.transform(1, 0, -0.4, 1, 0, 0); 
-             const grad = ctx.createLinearGradient(0, 0, sweepW, 0);
-             grad.addColorStop(0, 'rgba(255, 255, 255, 0)');
-             grad.addColorStop(0.5, `rgba(255, 255, 255, ${0.6 * intensity})`);
-             grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
-             ctx.fillStyle = grad;
-             ctx.fillRect(0, 0, sweepW, height);
-             ctx.restore();
-         }
-      }
+      colorCycleRef.current += 1;
+      updateParticles(16.66); // Assume 60fps for preview physics
+      drawScene(canvas, dataArrayRef.current, time);
+      animationRef.current = requestAnimationFrame(render);
     };
 
-    // --- RENDER LOOP LOGIC ---
-    
-    // If NOT rendering, use standard requestAnimationFrame for smoothest preview
-    if (!isRendering) {
-        // Clean up worker if it exists
-        if (workerRef.current) {
-            workerRef.current.terminate();
-            workerRef.current = null;
-        }
-
-        const tick = (time: number) => {
-            renderFrame(time);
-            animationRef.current = requestAnimationFrame(tick);
-        };
-        animationRef.current = requestAnimationFrame(tick);
-    } 
-    // If RENDERING, use Web Worker to prevent background throttling
-    else {
-        // Cancel rAF if running
-        if (animationRef.current) cancelAnimationFrame(animationRef.current);
-
-        // Create Worker
-        if (!workerRef.current) {
-            const blob = new Blob([`
-                let timer;
-                self.onmessage = function(e) {
-                    if (e.data.type === 'start') {
-                        const fps = e.data.fps || 30;
-                        const interval = 1000 / fps;
-                        timer = setInterval(() => {
-                            self.postMessage('tick');
-                        }, interval);
-                    } else if (e.data === 'stop') {
-                        clearInterval(timer);
-                    }
-                };
-            `], { type: 'application/javascript' });
-            
-            workerRef.current = new Worker(URL.createObjectURL(blob));
-            
-            workerRef.current.onmessage = () => {
-                // Pass performance.now() to match rAF timestamp signature
-                renderFrame(performance.now());
-            };
-            
-            workerRef.current.postMessage({ type: 'start', fps: fps });
-        }
-    }
+    animationRef.current = requestAnimationFrame(render);
 
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      if (workerRef.current) {
-          workerRef.current.terminate();
-          workerRef.current = null;
-      }
     };
-  }, [width, height, settings, analyser, isRendering, fps]); // Added fps dependency
+  }, [width, height, settings, analyser, isRendering]); // isRendering dependency is key
 
   return (
     <canvas 

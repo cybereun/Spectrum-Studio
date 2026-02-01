@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { AudioTrack, VisualSettings, EncodingSettings, SpectrumStyle, FilterPreset, ScreenEffect, ParticleEffect, SetupImages } from '../types';
 import { DEFAULT_VISUAL_SETTINGS } from '../constants';
-import { VisualizerCanvas } from './VisualizerCanvas';
+import { VisualizerCanvas, VisualizerCanvasRef } from './VisualizerCanvas';
+import { Muxer, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
 import { 
   Play, Pause, Download, 
   Settings, ImageIcon, Layers, Wand2, Palette,
@@ -11,6 +12,77 @@ import {
   Sunrise, Camera, ScanLine, Monitor, Gauge,
   ArrowUp, ArrowDown
 } from './IconComponents';
+
+// Add type definitions for WebCodecs API (AudioEncoder/AudioData) as they might be missing in the environment
+declare global {
+  class AudioEncoder {
+    constructor(init: {
+      output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void;
+      error: (error: DOMException) => void;
+    });
+    configure(config: AudioEncoderConfig): void;
+    encode(data: AudioData): void;
+    flush(): Promise<void>;
+    close(): void;
+    readonly state: "unconfigured" | "configured" | "closed";
+    readonly encodeQueueSize: number;
+  }
+
+  class AudioData {
+    constructor(init: AudioDataInit);
+    readonly format: "u8" | "s16" | "s32" | "f32" | "u8-planar" | "s16-planar" | "s32-planar" | "f32-planar";
+    readonly sampleRate: number;
+    readonly numberOfFrames: number;
+    readonly numberOfChannels: number;
+    readonly duration: number;
+    readonly timestamp: number;
+    allocationSize(options: AudioDataCopyToOptions): number;
+    copyTo(destination: BufferSource, options: AudioDataCopyToOptions): void;
+    clone(): AudioData;
+    close(): void;
+  }
+
+  interface AudioEncoderConfig {
+    codec: string;
+    sampleRate?: number;
+    numberOfChannels?: number;
+    bitrate?: number;
+  }
+
+  interface AudioDataInit {
+    format: "u8" | "s16" | "s32" | "f32" | "u8-planar" | "s16-planar" | "s32-planar" | "f32-planar";
+    sampleRate: number;
+    numberOfFrames: number;
+    numberOfChannels: number;
+    timestamp: number;
+    data: BufferSource;
+    transfer?: Transferable[];
+  }
+
+  interface AudioDataCopyToOptions {
+    planeIndex: number;
+    frameOffset?: number;
+    frameCount?: number;
+    format?: "u8" | "s16" | "s32" | "f32" | "u8-planar" | "s16-planar" | "s32-planar" | "f32-planar";
+  }
+
+  interface EncodedAudioChunk {
+    readonly type: 'key' | 'delta';
+    readonly timestamp: number;
+    readonly duration?: number;
+    readonly byteLength: number;
+    copyTo(destination: BufferSource): void;
+  }
+
+  interface EncodedAudioChunkMetadata {
+    decoderConfig?: {
+      codec: string;
+      sampleRate: number;
+      numberOfChannels: number;
+      description?: BufferSource;
+    };
+  }
+}
 
 interface StudioPhaseProps {
   playlist: AudioTrack[];
@@ -63,24 +135,17 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
   
   // Render Quality State
-  const [selectedPreset, setSelectedPreset] = useState<RenderConfig>(RENDER_PRESETS[1]); // Default to Balanced (30fps)
-  const [usedCodec, setUsedCodec] = useState<string>(""); // To track which codec was selected
+  const [selectedPreset, setSelectedPreset] = useState<RenderConfig>(RENDER_PRESETS[1]); 
 
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  
-  // Streaming Refs (For direct disk write)
-  const writableStreamRef = useRef<any>(null);
-  const writeQueueRef = useRef<Promise<void>>(Promise.resolve()); 
+  const canvasRef = useRef<VisualizerCanvasRef>(null);
   
   // Audio Graph Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null); 
-
+  
   // Calculations
   const playlistDuration = useMemo(() => playlist.reduce((acc, t) => acc + t.duration, 0), [playlist]);
   const totalDuration = useMemo(() => playlistDuration * encodingSettings.loopCount, [playlistDuration, encodingSettings.loopCount]);
@@ -123,11 +188,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         gain.connect(ctx.destination);
         gainNodeRef.current = gain;
 
-        // 3. Recorder Output (Always Connected)
-        const dest = ctx.createMediaStreamDestination();
-        destNodeRef.current = dest;
-        source.connect(dest); 
-        
       } catch (e) { console.error("Audio graph error", e); }
     }
   }, [audioRef.current]);
@@ -159,9 +219,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         setCurrentTrackIndex(0);
       } else {
         setIsPlaying(false);
-        if (isRendering) {
-          stopRenderingAndDownload();
-        }
       }
     }
   };
@@ -182,25 +239,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     }
   }, [currentTrackIndex, currentLoopIteration, playlist]);
 
-  // Update Progress during Render
-  useEffect(() => {
-    let interval: number;
-    if (isRendering && audioRef.current) {
-      interval = window.setInterval(() => {
-        let elapsed = 0;
-        elapsed += currentLoopIteration * playlistDuration;
-        for (let i = 0; i < currentTrackIndex; i++) {
-          elapsed += playlist[i].duration;
-        }
-        elapsed += audioRef.current?.currentTime || 0;
-
-        const progress = Math.min((elapsed / totalDuration) * 100, 99.9);
-        setRenderProgress(progress);
-      }, 200);
-    }
-    return () => clearInterval(interval);
-  }, [isRendering, currentLoopIteration, currentTrackIndex, playlistDuration, totalDuration]);
-
   // Playlist Management
   const removeTrack = (id: string) => {
     setPlaylist(prev => prev.filter(t => t.id !== id));
@@ -214,7 +252,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     setPlaylist(newPlaylist);
   };
 
-  // --- Rendering Logic ---
+  // --- NEW: OFFLINE Rendering Logic (HEVC + AAC + MP4 Muxer) ---
 
   const initiateRender = () => {
     setIsPlaying(false);
@@ -222,172 +260,240 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     setShowRenderModal(true);
   };
 
-  const startRendering = async () => {
-    if (!canvasRef.current || !destNodeRef.current || !audioRef.current) return;
-    
-    // Check API Support
+  const startOfflineRendering = async () => {
     if (!('showSaveFilePicker' in window)) {
-        alert("⛔ 브라우저 미지원: Chrome이나 Edge 최신 버전을 사용해주세요.");
+        alert("이 브라우저는 파일 저장 API를 지원하지 않습니다. (Chrome/Edge 사용 권장)");
         return;
     }
 
-    let writable: any = null;
-
+    let fileHandle: any;
     try {
-        const handle = await (window as any).showSaveFilePicker({
+        fileHandle = await (window as any).showSaveFilePicker({
             suggestedName: `${renderFilename.replace(/[^a-z0-9]/gi, '_')}.mp4`,
-            types: [{
-                description: 'Video File',
-                accept: { 'video/mp4': ['.mp4'] },
-            }],
+            types: [{ description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } }],
         });
-        writable = await handle.createWritable();
-
-    } catch (err: any) {
-        if (err.name === 'AbortError') return;
-        console.error("File System Access Error:", err);
-        alert(`⚠️ 저장 위치 선택 오류: ${err.message}`);
-        return; 
-    }
-
-    if (!writable) return;
+    } catch (err) { return; } // Cancelled
 
     setShowRenderModal(false);
     setIsRendering(true);
     setRenderProgress(0);
-    setRenderStatusText("코덱 확인 및 초기화 중...");
-    
-    // Set Refs
-    writableStreamRef.current = writable;
-    writeQueueRef.current = Promise.resolve();
-
-    // Reset playback position
-    setCurrentTrackIndex(0);
-    setCurrentLoopIteration(0);
-    audioRef.current.currentTime = 0;
-
-    // Mute Speakers
-    if (gainNodeRef.current) {
-      gainNodeRef.current.gain.setValueAtTime(0, audioContextRef.current?.currentTime || 0);
-    }
-
-    // Capture Streams - KEY CHANGE: Use selected preset FPS
-    const fps = selectedPreset.fps;
-    const canvasStream = canvasRef.current.captureStream(fps); 
-    const audioStream = destNodeRef.current.stream;
-    const combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
-
-    let mimeType = '';
-    const supportedTypes = [
-        // 1. HEVC (H.265) - High Quality & Efficiency (Prioritized)
-        'video/mp4; codecs="hvc1, mp4a.40.2"',
-        'video/mp4; codecs="hev1, mp4a.40.2"',
-
-        // 2. H.264 (AVC) High Profile - Better Quality than Main/Baseline
-        'video/mp4; codecs="avc1.640034, mp4a.40.2"', 
-        'video/mp4; codecs="avc1.640028, mp4a.40.2"',
-
-        // 3. H.264 (AVC) Main/Baseline - Standard Compatibility
-        'video/mp4; codecs="avc1.4d002a, mp4a.40.2"', 
-        'video/mp4; codecs="avc1.42002a, mp4a.40.2"',
-        
-        // 4. Generic MP4
-        'video/mp4',
-        
-        // 5. WebM Fallback
-        'video/webm; codecs=h264',
-        'video/webm; codecs=vp9'
-    ];
-
-    for (const type of supportedTypes) {
-        if (MediaRecorder.isTypeSupported(type)) {
-            mimeType = type;
-            console.log(`✅ Selected Codec: ${mimeType}`);
-            break;
-        }
-    }
-
-    if (!mimeType) mimeType = 'video/webm; codecs=vp9';
-    setUsedCodec(mimeType);
-    setRenderStatusText("영상 제작 중...");
+    setRenderStatusText("오디오 데이터 준비 중...");
 
     try {
-      mediaRecorderRef.current = new MediaRecorder(combinedStream, {
-        mimeType,
-        audioBitsPerSecond: encodingSettings.audioBitrate || 128000, 
-        videoBitsPerSecond: selectedPreset.bitrate // Use selected bitrate
-      });
-    } catch (e) {
-      console.warn("Recorder init failed", e);
-      alert("녹화 초기화 실패. 브라우저가 선택된 코덱을 지원하지 않을 수 있습니다.");
-      setIsRendering(false);
-      return;
-    }
+        // 1. Prepare Audio Buffers
+        const audioContext = new AudioContext();
+        const trackBuffers: AudioBuffer[] = [];
+        
+        for (const track of playlist) {
+            const arrayBuffer = await track.file.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            trackBuffers.push(audioBuffer);
+        }
+        audioContext.close();
 
-    mediaRecorderRef.current.ondataavailable = async (e) => {
-      if (e.data.size > 0 && writableStreamRef.current) {
-          const blob = e.data;
-          writeQueueRef.current = writeQueueRef.current.then(async () => {
-              try {
-                  if (writableStreamRef.current) {
-                      await writableStreamRef.current.write(blob);
-                  }
-              } catch (writeErr) {
-                  console.error("Stream write error", writeErr);
-              }
-          });
-      }
-    };
+        // 2. Setup OfflineAudioContext (The High-Speed Mixer)
+        // Note: Offline context length is in sample frames
+        const sampleRate = 48000;
+        const totalDurationSamples = Math.ceil(totalDuration * sampleRate);
+        const offlineCtx = new OfflineAudioContext(2, totalDurationSamples, sampleRate);
+        
+        // Schedule Tracks
+        let startTime = 0;
+        for (let loop = 0; loop < encodingSettings.loopCount; loop++) {
+            for (const buffer of trackBuffers) {
+                const source = offlineCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(offlineCtx.destination);
+                source.start(startTime);
+                startTime += buffer.duration;
+            }
+        }
 
-    mediaRecorderRef.current.onstop = async () => {
-        setRenderStatusText("파일 저장 마무리 중...");
+        // Setup Analyser for Visualizer (attached to offline context!)
+        // To get spectrum data during offline render, we connect a source tap to an analyser
+        // However, standard OfflineContext renders all at once.
+        // We need to use `suspend` loop to grab frames.
+        const analyserNode = offlineCtx.createAnalyser();
+        analyserNode.fftSize = 2048;
+        
+        // Re-connect graph through analyser for visualization data
+        // We have to re-schedule strictly for the analyser tap if we want global output visualization
+        // Simpler approach: Create a master gain, connect all sources to master, master to Dest AND Analyser
+        const masterGain = offlineCtx.createGain();
+        masterGain.connect(offlineCtx.destination);
+        masterGain.connect(analyserNode);
+
+        startTime = 0;
+        for (let loop = 0; loop < encodingSettings.loopCount; loop++) {
+            for (const buffer of trackBuffers) {
+                const source = offlineCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(masterGain);
+                source.start(startTime);
+                startTime += buffer.duration;
+            }
+        }
+
+        // 3. Setup Video Encoder (HEVC)
+        const fps = selectedPreset.fps;
+        const width = 1280; // or 1920 based on quality settings, keeping simple for now
+        const height = 720;
+        
+        const muxer = new Muxer({
+            target: new FileSystemWritableFileStreamTarget(await fileHandle.createWritable()),
+            video: {
+                codec: 'hvc1', // HEVC
+                width,
+                height,
+                frameRate: fps
+            },
+            audio: {
+                codec: 'mp4a.40.2', // AAC
+                numberOfChannels: 2,
+                sampleRate
+            },
+            firstTimestampBehavior: 'offset', 
+        });
+
+        const videoEncoder = new VideoEncoder({
+            output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+            error: (e) => { console.error("Video Encode Error", e); alert("인코딩 오류: " + e.message); }
+        });
+
+        // HEVC Main Profile, Level 4.0 (for up to 1080p)
+        const videoConfig: VideoEncoderConfig = {
+            codec: 'hvc1.1.6.L120.B0', 
+            width,
+            height,
+            bitrate: selectedPreset.bitrate,
+            framerate: fps,
+        };
+
+        // Fallback to AVC if HEVC not supported
+        const support = await VideoEncoder.isConfigSupported(videoConfig);
+        if (!support.supported) {
+            console.warn("HEVC not supported, falling back to AVC (H.264)");
+            videoConfig.codec = 'avc1.640028'; // H.264 High Profile
+        }
+
+        videoEncoder.configure(videoConfig);
+
+        // 4. Setup Audio Encoder (AAC)
+        const audioEncoder = new AudioEncoder({
+            output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+            error: (e) => console.error("Audio Encode Error", e)
+        });
+
+        audioEncoder.configure({
+            codec: 'mp4a.40.2',
+            numberOfChannels: 2,
+            sampleRate,
+            bitrate: encodingSettings.audioBitrate,
+        });
+
+        // 5. RENDER LOOP (The Magic)
+        setRenderStatusText("고속 렌더링 진행 중...");
+        
+        const frameDuration = 1 / fps;
+        const totalFrames = Math.ceil(totalDuration * fps);
+        const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+
+        // Schedule suspensions for every frame
+        // Note: loop starts from 0.0 (first frame)
+        for (let i = 0; i < totalFrames; i++) {
+            const time = i * frameDuration;
+            
+            // Suspend context at specific time to capture frame
+            offlineCtx.suspend(time).then(async () => {
+                // A. Update Visuals
+                analyserNode.getByteFrequencyData(dataArray);
+                
+                // Draw to hidden canvas via ref
+                const canvas = canvasRef.current?.getCanvas();
+                if (canvasRef.current && canvas) {
+                    canvasRef.current.drawOfflineFrame(time * 1000, dataArray);
+                    
+                    // B. Encode Video Frame
+                    const bitmap = await createImageBitmap(canvas);
+                    const videoFrame = new VideoFrame(bitmap, { timestamp: time * 1000000, duration: frameDuration * 1000000 });
+                    videoEncoder.encode(videoFrame, { keyFrame: i % (fps * 2) === 0 });
+                    videoFrame.close();
+                    bitmap.close();
+                }
+
+                // Update Progress
+                setRenderProgress((i / totalFrames) * 90); 
+                
+                // Continue
+                offlineCtx.resume();
+            });
+        }
+
+        // Start the offline rendering process
+        // This promise resolves when the ENTIRE audio buffer is rendered.
+        // During this process, the `suspend` callbacks will fire, encoding video.
+        const renderedBuffer = await offlineCtx.startRendering();
+
+        setRenderStatusText("오디오 인코딩 중...");
+
+        // 6. Encode Audio
+        // We need to chunk the AudioBuffer into AudioData objects
+        const numberOfChannels = renderedBuffer.numberOfChannels;
+        const totalSamples = renderedBuffer.length;
+        const chunkDuration = 1; // 1 second chunks for encoding
+        const chunkSamples = sampleRate * chunkDuration;
+        
+        for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
+            const size = Math.min(chunkSamples, totalSamples - offset);
+            
+            // Interleave logic for AudioData (Format: f32-planar is preferred for AudioData but let's check input)
+            // AudioData constructor takes planar data directly!
+            const planarData = new Float32Array(size * numberOfChannels);
+            
+            for (let ch = 0; ch < numberOfChannels; ch++) {
+                const channelData = renderedBuffer.getChannelData(ch);
+                // Copy segment
+                const segment = channelData.subarray(offset, offset + size);
+                // Planar format: Channel 0 followed by Channel 1...
+                planarData.set(segment, ch * size);
+            }
+
+            const audioData = new AudioData({
+                format: 'f32-planar',
+                sampleRate,
+                numberOfFrames: size,
+                numberOfChannels,
+                timestamp: (offset / sampleRate) * 1000000,
+                data: planarData
+            });
+
+            audioEncoder.encode(audioData);
+            audioData.close();
+        }
+
+        setRenderStatusText("파일 패키징 중...");
+
+        // 7. Finalize
+        await videoEncoder.flush();
+        await audioEncoder.flush();
+        muxer.finalize();
+        
         setRenderProgress(100);
+        alert(`✅ 렌더링 완료!\n${renderFilename}.mp4 파일이 생성되었습니다.`);
 
-        if (writableStreamRef.current) {
-             try {
-                 await writeQueueRef.current; 
-                 await writableStreamRef.current.close();
-                 alert(`✅ 저장 완료!\n\n${renderFilename}.mp4 파일이 정상적으로 저장되었습니다.`);
-             } catch(e) { 
-                 alert("파일 저장 마무리 중 오류가 발생했습니다.");
-             }
-        }
-        
+    } catch (e: any) {
+        console.error(e);
+        alert(`❌ 렌더링 중 오류 발생: ${e.message}`);
+    } finally {
         setIsRendering(false);
-        setIsPlaying(false);
-        setRenderProgress(0);
-        
-        if (gainNodeRef.current) {
-            gainNodeRef.current.gain.setValueAtTime(1, audioContextRef.current?.currentTime || 0);
-        }
-    };
-
-    mediaRecorderRef.current.start(1000); 
-    setIsPlaying(true);
-    audioRef.current.play();
+    }
   };
 
-  const stopRenderingAndDownload = () => {
-    if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') return;
-    mediaRecorderRef.current.stop();
-    audioRef.current?.pause();
-  };
-
-  const cancelRendering = async () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.onstop = null;
-      mediaRecorderRef.current.stop();
-    }
-    
-    if (writableStreamRef.current) {
-        try { await writableStreamRef.current.abort(); } catch(e) {}
-    }
-
-    setIsRendering(false);
-    setIsPlaying(false);
-    audioRef.current?.pause();
-    if (gainNodeRef.current) {
-      gainNodeRef.current.gain.setValueAtTime(1, audioContextRef.current?.currentTime || 0);
+  const cancelRendering = () => {
+    // With offline rendering, cancellation is tricky as it's a tight loop.
+    // For now, we just reload or expect the user to close.
+    if(confirm("렌더링을 중단하시겠습니까? (페이지가 새로고침됩니다)")) {
+        window.location.reload();
     }
   };
 
@@ -418,7 +524,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                  {/* Quality Selector */}
                  <div>
                     <label className="block text-sm text-gray-400 mb-2 flex items-center gap-2">
-                        <Gauge size={16}/> 렌더링 품질 (멈춤 방지)
+                        <Gauge size={16}/> 렌더링 품질
                     </label>
                     <div className="grid grid-cols-1 gap-3">
                         {RENDER_PRESETS.map((preset) => (
@@ -446,12 +552,11 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                  </div>
 
                  <div className="p-4 bg-gray-900/50 rounded-lg text-xs text-gray-400 border border-gray-700">
-                    <p className="mb-2 text-cyan-400 font-bold">📢 코덱 안내</p>
+                    <p className="mb-2 text-cyan-400 font-bold">📢 고속 렌더링 모드</p>
                     <ul className="list-disc list-inside space-y-1">
-                        <li><strong>HEVC (H.265)</strong> 코덱을 우선적으로 시도합니다.</li>
-                        <li>지원되지 않을 경우, 고화질 <strong>H.264 High Profile</strong>을 사용합니다.</li>
-                        <li>오디오는 표준 <strong>AAC (mp4a.40.2)</strong>로 인코딩됩니다.</li>
-                        <li className="text-red-400">주의: 렌더링 중 창을 내리거나 닫지 마세요.</li>
+                        <li><strong>HEVC(H.265)</strong> + <strong>AAC</strong> 코덱을 사용하여 MP4를 생성합니다.</li>
+                        <li>재생 속도보다 훨씬 빠르게 영상을 제작합니다.</li>
+                        <li className="text-red-400">주의: 하드웨어 성능에 따라 브라우저가 일시적으로 느려질 수 있습니다.</li>
                     </ul>
                  </div>
 
@@ -463,10 +568,10 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                         취소
                      </button>
                      <button 
-                        onClick={startRendering}
+                        onClick={startOfflineRendering}
                         className="flex-1 py-3 rounded-lg bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold shadow-lg transition-transform transform active:scale-95"
                      >
-                        렌더링 시작
+                        고속 렌더링 시작
                      </button>
                  </div>
              </div>
@@ -499,18 +604,13 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                           style={{ width: `${renderProgress}%` }}
                        />
                    </div>
-                   <p className="text-xs text-gray-500 mt-4 animate-pulse">
-                        {selectedPreset.label} 모드 동작 중<br/>
-                        <span className="font-mono text-cyan-500">Codec: {usedCodec}</span><br/>
-                        <span className="text-red-500 font-bold">주의: 브라우저 창을 닫거나 최소화하지 마세요.</span>
-                   </p>
                </div>
 
                <button 
                   onClick={cancelRendering}
                   className="mt-8 px-6 py-2 rounded-full border border-red-900/50 text-red-500 hover:bg-red-900/20 text-sm transition-colors"
                >
-                  렌더링 취소
+                  중단 (새로고침)
                </button>
            </div>
         </div>
