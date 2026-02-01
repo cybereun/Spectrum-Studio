@@ -7,7 +7,8 @@ interface VisualizerCanvasProps {
   width: number;
   height: number;
   isPlaying: boolean;
-  isRendering?: boolean; // New prop to switch render mode
+  isRendering?: boolean;
+  fps?: number; // New prop for Target FPS
 }
 
 export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasProps>(({
@@ -16,7 +17,8 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
   width,
   height,
   isPlaying,
-  isRendering = false
+  isRendering = false,
+  fps = 30 // Default to 30 if not provided
 }, ref) => {
   const internalRef = useRef<HTMLCanvasElement>(null);
   const canvasRef = (ref as React.RefObject<HTMLCanvasElement>) || internalRef;
@@ -597,11 +599,12 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
             const blob = new Blob([`
                 let timer;
                 self.onmessage = function(e) {
-                    if (e.data === 'start') {
-                        // 60 FPS target
+                    if (e.data.type === 'start') {
+                        const fps = e.data.fps || 30;
+                        const interval = 1000 / fps;
                         timer = setInterval(() => {
                             self.postMessage('tick');
-                        }, 1000 / 60);
+                        }, interval);
                     } else if (e.data === 'stop') {
                         clearInterval(timer);
                     }
@@ -615,7 +618,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
                 renderFrame(performance.now());
             };
             
-            workerRef.current.postMessage('start');
+            workerRef.current.postMessage({ type: 'start', fps: fps });
         }
     }
 
@@ -626,7 +629,7 @@ export const VisualizerCanvas = forwardRef<HTMLCanvasElement, VisualizerCanvasPr
           workerRef.current = null;
       }
     };
-  }, [width, height, settings, analyser, isRendering]); // Re-run when isRendering changes
+  }, [width, height, settings, analyser, isRendering, fps]); // Added fps dependency
 
   return (
     <canvas 

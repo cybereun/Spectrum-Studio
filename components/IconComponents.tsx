@@ -32,7 +32,9 @@ import {
   Check,
   Sunrise,
   Camera,
-  ScanLine
+  ScanLine,
+  Monitor,
+  Gauge
 } from 'lucide-react';
 
 export {
@@ -69,5 +71,7 @@ export {
   Check,
   Sunrise,
   Camera,
-  ScanLine
+  ScanLine,
+  Monitor,
+  Gauge
 };

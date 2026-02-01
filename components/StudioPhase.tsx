@@ -8,7 +8,7 @@ import {
   Move, Trash2, Heart, Flame, Layout, Sliders,
   X, CloudSnow, CloudFog, Flower2, Sun,
   Activity, Film, Zap, PartyPopper, Check,
-  Sunrise, Camera, ScanLine
+  Sunrise, Camera, ScanLine, Monitor, Gauge
 } from './IconComponents';
 
 interface StudioPhaseProps {
@@ -23,6 +23,21 @@ const PALETTE_COLORS = [
   '#00CCFF', '#FFFFFF', '#FF6600', '#CC00FF', 
   '#00FF00', '#0000FF', '#FF00FF', '#FFFF00', 
   '#00FFFF', '#000000', '#808080'
+];
+
+// Render Presets
+interface RenderConfig {
+  id: 'high' | 'balanced' | 'fast';
+  label: string;
+  fps: number;
+  bitrate: number;
+  description: string;
+}
+
+const RENDER_PRESETS: RenderConfig[] = [
+  { id: 'high', label: '고화질 (60fps)', fps: 60, bitrate: 8000000, description: '부드러운 움직임, 고사양 PC 권장' },
+  { id: 'balanced', label: '일반 (30fps)', fps: 30, bitrate: 5000000, description: '권장 설정, 멈춤 없이 안정적' },
+  { id: 'fast', label: '저사양 (30fps)', fps: 30, bitrate: 2500000, description: '빠른 처리, 용량 절약' },
 ];
 
 export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlaylist, onBack, initialImages, encodingSettings }) => {
@@ -45,22 +60,24 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   const [renderProgress, setRenderProgress] = useState(0);
   const [renderStatusText, setRenderStatusText] = useState(""); 
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
+  
+  // Render Quality State
+  const [selectedPreset, setSelectedPreset] = useState<RenderConfig>(RENDER_PRESETS[1]); // Default to Balanced (30fps)
 
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  // Removed recordedChunksRef as we strictly enforce disk writing
   
   // Streaming Refs (For direct disk write)
   const writableStreamRef = useRef<any>(null);
-  const writeQueueRef = useRef<Promise<void>>(Promise.resolve()); // Ensure sequential writes
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve()); 
   
   // Audio Graph Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null); // To control speaker volume
+  const gainNodeRef = useRef<GainNode | null>(null); 
 
   // Calculations
   const playlistDuration = useMemo(() => playlist.reduce((acc, t) => acc + t.duration, 0), [playlist]);
@@ -107,7 +124,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         // 3. Recorder Output (Always Connected)
         const dest = ctx.createMediaStreamDestination();
         destNodeRef.current = dest;
-        source.connect(dest); // Direct connection for clean audio recording
+        source.connect(dest); 
         
       } catch (e) { console.error("Audio graph error", e); }
     }
@@ -139,7 +156,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         setCurrentLoopIteration(prev => prev + 1);
         setCurrentTrackIndex(0);
       } else {
-        // End of Playlist & Loops
         setIsPlaying(false);
         if (isRendering) {
           stopRenderingAndDownload();
@@ -151,7 +167,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   // Sync Audio Element
   useEffect(() => {
     if (audioRef.current && playlist.length > 0) {
-      // Create new blob URL
       const newUrl = URL.createObjectURL(playlist[currentTrackIndex].file);
       audioRef.current.src = newUrl;
       
@@ -159,7 +174,6 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
         audioRef.current.play().catch(e => console.error("Play error", e));
       }
       
-      // Cleanup function to revoke old URL when track changes or unmounts
       return () => {
         URL.revokeObjectURL(newUrl);
       };
@@ -171,20 +185,16 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     let interval: number;
     if (isRendering && audioRef.current) {
       interval = window.setInterval(() => {
-        // Calculate total elapsed time
         let elapsed = 0;
-        // Previous loops
         elapsed += currentLoopIteration * playlistDuration;
-        // Previous tracks in current loop
         for (let i = 0; i < currentTrackIndex; i++) {
           elapsed += playlist[i].duration;
         }
-        // Current track time
         elapsed += audioRef.current?.currentTime || 0;
 
         const progress = Math.min((elapsed / totalDuration) * 100, 99.9);
         setRenderProgress(progress);
-      }, 100);
+      }, 200);
     }
     return () => clearInterval(interval);
   }, [isRendering, currentLoopIteration, currentTrackIndex, playlistDuration, totalDuration]);
@@ -213,24 +223,15 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   const startRendering = async () => {
     if (!canvasRef.current || !destNodeRef.current || !audioRef.current) return;
     
-    // --- Strict Direct-to-Disk Enforcement ---
-
-    // 1. Check API Support
+    // Check API Support
     if (!('showSaveFilePicker' in window)) {
-        alert(
-            "⛔ 브라우저 미지원\n\n" +
-            "현재 브라우저는 '하드디스크 직접 저장(File System Access API)'을 지원하지 않습니다.\n" +
-            "메모리 부족으로 인한 오류를 방지하기 위해 렌더링을 시작할 수 없습니다.\n\n" +
-            "PC 환경의 Chrome, Edge 최신 버전을 사용해주세요."
-        );
+        alert("⛔ 브라우저 미지원: Chrome이나 Edge 최신 버전을 사용해주세요.");
         return;
     }
 
     let writable: any = null;
 
     try {
-        // 2. Open File Picker explicitly
-        // NOTE: This MUST be the very first async operation to avoid security blocking
         const handle = await (window as any).showSaveFilePicker({
             suggestedName: `${renderFilename.replace(/[^a-z0-9]/gi, '_')}.mp4`,
             types: [{
@@ -238,47 +239,25 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                 accept: { 'video/mp4': ['.mp4'] },
             }],
         });
-        
-        // 3. Create Writable Stream
         writable = await handle.createWritable();
 
     } catch (err: any) {
-        // User cancelled the picker
-        if (err.name === 'AbortError') {
-            return; // Just stop, do not start rendering
-        }
-        
+        if (err.name === 'AbortError') return;
         console.error("File System Access Error:", err);
-
-        // Security / Iframe Blocked
-        if (err.name === 'SecurityError' || err.message?.includes('Security') || err.message?.includes('Cross origin')) {
-            alert(
-                "⛔ 저장 권한 차단됨 (보안)\n\n" +
-                "브라우저 보안 정책에 의해 하드디스크 쓰기 권한이 차단되었습니다.\n\n" +
-                "다음 사항을 확인해주세요:\n" +
-                "1. HTTPS (보안 연결) 환경에서 접속하셨나요?\n" +
-                "2. 페이지가 아이프레임(Iframe) 내부에 있나요?\n\n" +
-                "해결 방법: 이 페이지를 브라우저의 '새 탭'에서 직접 열어서 다시 시도해주세요."
-            );
-        } else {
-            alert(`⚠️ 저장 위치 선택 오류: ${err.message}\n\n작업을 중단합니다.`);
-        }
-        
-        // STRICTLY RETURN if disk access fails. NO MEMORY FALLBACK.
+        alert(`⚠️ 저장 위치 선택 오류: ${err.message}`);
         return; 
     }
 
-    // Only proceed if we have a writable stream
     if (!writable) return;
 
     setShowRenderModal(false);
     setIsRendering(true);
     setRenderProgress(0);
-    setRenderStatusText("탐색기 저장 모드 동작 중...");
+    setRenderStatusText("안정 모드 렌더링 중...");
     
     // Set Refs
     writableStreamRef.current = writable;
-    writeQueueRef.current = Promise.resolve(); // Reset write queue
+    writeQueueRef.current = Promise.resolve();
 
     // Reset playback position
     setCurrentTrackIndex(0);
@@ -290,33 +269,23 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
       gainNodeRef.current.gain.setValueAtTime(0, audioContextRef.current?.currentTime || 0);
     }
 
-    // Capture Streams
-    const canvasStream = canvasRef.current.captureStream(60); // 60 FPS
+    // Capture Streams - KEY CHANGE: Use selected preset FPS
+    const fps = selectedPreset.fps;
+    const canvasStream = canvasRef.current.captureStream(fps); 
     const audioStream = destNodeRef.current.stream;
     const combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
 
-    // Codec Selection - Adjusted for Stability
     let mimeType = '';
     const supportedTypes = [
-        // 1. H.264 Main Profile (Most stable, widely supported)
         'video/mp4; codecs="avc1.4d002a, mp4a.40.2"',
         'video/mp4; codecs="avc1.42002a, mp4a.40.2"',
-
-        // 2. H.264 High Profile (Better quality, but sometimes higher CPU load)
-        'video/mp4; codecs="avc1.640034, mp4a.40.2"', 
-        'video/mp4; codecs="avc1.640028, mp4a.40.2"',
-        
-        // 3. Generic MP4
         'video/mp4',
-        
-        // 4. WebM Fallback
         'video/webm; codecs=h264',
     ];
 
     for (const type of supportedTypes) {
         if (MediaRecorder.isTypeSupported(type)) {
             mimeType = type;
-            console.log(`✅ Using GPU Candidate Codec: ${mimeType}`);
             break;
         }
     }
@@ -324,27 +293,21 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
     if (!mimeType) mimeType = 'video/webm; codecs=vp9'; 
 
     try {
-      // Reduced Bitrate to 8Mbps (8,000,000) for stability. 
-      // 25Mbps is too high for real-time disk writing in browser.
       mediaRecorderRef.current = new MediaRecorder(combinedStream, {
         mimeType,
         audioBitsPerSecond: encodingSettings.audioBitrate || 128000, 
-        videoBitsPerSecond: 8000000 // 8 Mbps (Standard 1080p)
+        videoBitsPerSecond: selectedPreset.bitrate // Use selected bitrate
       });
     } catch (e) {
       console.warn("Recorder init failed", e);
-      alert("녹화 초기화 실패. 브라우저가 해당 코덱을 지원하지 않을 수 있습니다.");
+      alert("녹화 초기화 실패.");
       setIsRendering(false);
       return;
     }
 
-    // Handle Data (Stream to Disk ONLY)
     mediaRecorderRef.current.ondataavailable = async (e) => {
-      // Strictly check if we have data AND a writable stream
       if (e.data.size > 0 && writableStreamRef.current) {
           const blob = e.data;
-          
-          // Sequential Write Queue to prevent file corruption
           writeQueueRef.current = writeQueueRef.current.then(async () => {
               try {
                   if (writableStreamRef.current) {
@@ -352,47 +315,35 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                   }
               } catch (writeErr) {
                   console.error("Stream write error", writeErr);
-                  // Only stop if critical
-                  // Stop usually happens on next chunk if persistent
               }
-          }).catch(err => console.error("Queue error", err));
+          });
       }
     };
 
-    // Cleanup on Stop
     mediaRecorderRef.current.onstop = async () => {
         setRenderStatusText("파일 저장 마무리 중...");
         setRenderProgress(100);
 
         if (writableStreamRef.current) {
              try {
-                 await writeQueueRef.current; // Wait for pending writes
+                 await writeQueueRef.current; 
                  await writableStreamRef.current.close();
-                 console.log("File saved successfully via streaming.");
-                 // Simple Success Alert
                  alert(`✅ 저장 완료!\n\n${renderFilename}.mp4 파일이 정상적으로 저장되었습니다.`);
              } catch(e) { 
-                 console.error("Stream close error", e); 
-                 alert("파일 저장 마무리(Close) 중 오류가 발생했습니다. 파일이 손상되었을 수 있습니다.");
+                 alert("파일 저장 마무리 중 오류가 발생했습니다.");
              }
         }
         
-        // Reset UI State
         setIsRendering(false);
         setIsPlaying(false);
         setRenderProgress(0);
         
-        // Unmute
         if (gainNodeRef.current) {
             gainNodeRef.current.gain.setValueAtTime(1, audioContextRef.current?.currentTime || 0);
         }
     };
 
-    // Start Recording
-    // Increased to 1000ms (1 second) to reduce Disk I/O frequency
     mediaRecorderRef.current.start(1000); 
-    
-    // Start Playback
     setIsPlaying(true);
     audioRef.current.play();
   };
@@ -409,11 +360,8 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
       mediaRecorderRef.current.stop();
     }
     
-    // Abort stream if active
     if (writableStreamRef.current) {
-        try {
-            await writableStreamRef.current.abort();
-        } catch(e) {}
+        try { await writableStreamRef.current.abort(); } catch(e) {}
     }
 
     setIsRendering(false);
@@ -427,37 +375,70 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100 overflow-hidden font-sans relative">
       
-      {/* 1. Filename Modal */}
+      {/* 1. Filename & Quality Modal */}
       {showRenderModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-          <div className="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-2xl w-full max-w-md animate-fadeIn">
+          <div className="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-2xl w-full max-w-lg animate-fadeIn">
              <h2 className="text-2xl font-bold text-cyan-400 mb-6 flex items-center gap-2">
-                <Film size={28}/> 영상 출력 (Direct Disk Mode)
+                <Film size={28}/> 영상 출력 설정
              </h2>
-             <div className="space-y-4">
+             
+             <div className="space-y-6">
+                 {/* Filename Input */}
                  <div>
-                     <label className="block text-sm text-gray-400 mb-2">파일 이름 (확장자 제외)</label>
+                     <label className="block text-sm text-gray-400 mb-2">파일 이름</label>
                      <input 
                         type="text" 
                         value={renderFilename}
                         onChange={(e) => setRenderFilename(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-600 rounded-lg p-3 text-white focus:border-cyan-500 outline-none transition-colors"
+                        className="w-full bg-gray-900 border border-gray-600 rounded-lg p-3 text-white focus:border-cyan-500 outline-none"
                         placeholder="My_Spectrum_Video"
                      />
                  </div>
+
+                 {/* Quality Selector */}
+                 <div>
+                    <label className="block text-sm text-gray-400 mb-2 flex items-center gap-2">
+                        <Gauge size={16}/> 렌더링 품질 (멈춤 방지)
+                    </label>
+                    <div className="grid grid-cols-1 gap-3">
+                        {RENDER_PRESETS.map((preset) => (
+                            <button
+                                key={preset.id}
+                                onClick={() => setSelectedPreset(preset)}
+                                className={`flex items-center justify-between p-3 rounded-lg border text-left transition-all ${
+                                    selectedPreset.id === preset.id 
+                                    ? 'bg-cyan-900/40 border-cyan-500 ring-1 ring-cyan-500' 
+                                    : 'bg-gray-700/50 border-gray-600 hover:bg-gray-700'
+                                }`}
+                            >
+                                <div>
+                                    <div className={`font-bold text-sm ${selectedPreset.id === preset.id ? 'text-cyan-300' : 'text-gray-200'}`}>
+                                        {preset.label}
+                                    </div>
+                                    <div className="text-xs text-gray-400 mt-0.5">{preset.description}</div>
+                                </div>
+                                <div className="text-xs font-mono text-gray-500 bg-black/20 px-2 py-1 rounded">
+                                    {(preset.bitrate / 1000000).toFixed(1)}Mbps
+                                </div>
+                            </button>
+                        ))}
+                    </div>
+                 </div>
+
                  <div className="p-4 bg-gray-900/50 rounded-lg text-xs text-gray-400 border border-gray-700">
-                    <p className="mb-2 text-cyan-400 font-bold">📢 필수 안내 (메모리 오류 방지)</p>
+                    <p className="mb-2 text-cyan-400 font-bold">📢 렌더링 팁</p>
                     <ul className="list-disc list-inside space-y-1">
-                        <li><strong>탐색기 창이 뜨면 저장할 위치를 지정해야 시작됩니다.</strong></li>
-                        <li>GPU 하드웨어 가속을 사용하여 <strong>실시간으로 하드디스크에 기록</strong>합니다.</li>
-                        <li>화질: 1080p @ 60fps (8Mbps)</li>
-                        <li className="text-red-400">렌더링 중 브라우저 탭을 내리거나 최소화하면 멈출 수 있습니다.</li>
+                        <li><strong>'일반 (30fps)'</strong> 설정을 권장합니다. 60fps는 부하가 큽니다.</li>
+                        <li>탐색기 창이 뜨면 저장할 위치를 지정해야 시작됩니다.</li>
+                        <li className="text-red-400">렌더링 중 브라우저 탭을 닫거나 최소화하지 마세요.</li>
                     </ul>
                  </div>
-                 <div className="flex gap-3 mt-6">
+
+                 <div className="flex gap-3 pt-2">
                      <button 
                         onClick={() => setShowRenderModal(false)}
-                        className="flex-1 py-3 rounded-lg border border-gray-600 hover:bg-gray-700 text-gray-300 transition-colors"
+                        className="flex-1 py-3 rounded-lg border border-gray-600 hover:bg-gray-700 text-gray-300"
                      >
                         취소
                      </button>
@@ -465,7 +446,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                         onClick={startRendering}
                         className="flex-1 py-3 rounded-lg bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold shadow-lg transition-transform transform active:scale-95"
                      >
-                        위치 선택 및 렌더링 시작
+                        렌더링 시작
                      </button>
                  </div>
              </div>
@@ -489,7 +470,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
 
                <div className="relative pt-4">
                    <div className="flex justify-between text-sm font-bold mb-2">
-                       <span className="text-cyan-400">Progress</span>
+                       <span className="text-cyan-400">진행률</span>
                        <span className="text-white">{renderProgress.toFixed(1)}%</span>
                    </div>
                    <div className="h-4 bg-gray-800 rounded-full overflow-hidden border border-gray-700">
@@ -499,7 +480,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                        />
                    </div>
                    <p className="text-xs text-gray-500 mt-4 animate-pulse">
-                        안정화 모드 활성화됨 (8Mbps / 1s Chunk)<br/>
+                        {selectedPreset.label} 모드 동작 중<br/>
                         <span className="text-red-500 font-bold">주의: 브라우저 창을 닫거나 최소화하지 마세요.</span>
                    </p>
                </div>
@@ -780,6 +761,7 @@ export const StudioPhase: React.FC<StudioPhaseProps> = ({ playlist: initialPlayl
                         height={720}
                         isPlaying={isPlaying}
                         isRendering={isRendering}
+                        fps={selectedPreset.fps}
                     />
                     
                     {/* Centered Play Button Overlay */}
